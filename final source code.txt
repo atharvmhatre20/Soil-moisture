@@ -1,0 +1,210 @@
+#include <WiFi.h>
+#include <Arduino.h>
+#include "FS.h"
+#include "SPIFFS.h"
+
+unsigned long totalPumpOnTime = 0;
+
+// WiFi Access Point credentials
+const char *ssid = "Sem6_project";
+const char *password = "12345678";
+
+// Moisture sensor and control pin
+const int sensorPin = 34;
+const int controlPin = 4;
+
+WiFiServer server(80);
+bool gpioState = false;
+bool autoMode = false;
+unsigned long pumpDuration = 0;
+unsigned long lastPumpStartTime = 0;
+
+// Log storage
+#define MAX_LOGS 10
+String moistureLogs[MAX_LOGS];
+int logIndex = 0;
+
+void setup() {
+  Serial.begin(115200);
+pinMode(sensorPin, INPUT);
+  pinMode(controlPin, OUTPUT);
+  digitalWrite(controlPin, HIGH);
+
+  // Start SPIFFS
+  if (!SPIFFS.begin(true)) {
+    Serial.println("SPIFFS Mount Failed!");
+    return;
+  }
+  Serial.println("SPIFFS Mounted Successfully");
+
+  // Start WiFi Access Point
+  WiFi.softAP(ssid, password);
+  Serial.println("Access Point Started");
+  Serial.print("IP Address: ");
+  Serial.println(WiFi.softAPIP());
+
+  server.begin();
+}
+
+// Save logs to SPIFFS in CSV format
+void saveLogToFile(String logEntry) {
+  File file = SPIFFS.open("/moisture_log.csv", FILE_APPEND);
+  if (!file) {
+    Serial.println("Failed to open log file for writing.");
+    return;
+  }
+
+  // Add header if file is empty
+  if (file.size() == 0) {
+file.println("Time (ms),Moisture (%),Pump ON Duration (ms),Moisture Status");
+}
+  file.println(logEntry);
+  file.close();
+}
+
+// Serve log file for download in CSV format
+void handleDownload(WiFiClient client) {
+  File file = SPIFFS.open("/moisture_log.csv", FILE_READ);
+  if (!file) {
+    client.println("HTTP/1.1 500 Internal Server Error");
+    client.println("Content-Type: text/plain");
+    client.println();
+    client.println("Failed to open log file.");
+    return;
+  }
+
+  client.println("HTTP/1.1 200 OK");
+  client.println("Content-Type: text/csv");
+  client.println("Content-Disposition: attachment; filename=moisture_log.csv");
+  client.println("Connection: close");
+  client.println();
+
+  while (file.available()) {
+    client.write(file.read());
+  }
+
+  file.close();
+}
+void loop() {
+  WiFiClient client = server.available();
+  if (!client) return;
+
+  Serial.println("New Client Connected");
+  unsigned long timeout = millis() + 2000;
+  while (!client.available() && millis() < timeout) {
+    delay(10);
+  }
+
+  if (!client.available()) {
+    Serial.println("Client Disconnected (Timeout)");
+    client.stop();
+    return;
+  }
+
+  String request = client.readStringUntil('\r');
+  Serial.println("Request: " + request);
+
+  if (request.indexOf("/toggle") != -1) {
+    gpioState = !gpioState;
+    digitalWrite(controlPin, gpioState ? HIGH : LOW);
+    autoMode = false;
+  }
+
+  if (request.indexOf("/auto") != -1) {
+    autoMode = !autoMode;
+  }
+
+  if (request.indexOf("/pump") != -1) {
+String durationString = request.substring(request.indexOf("duration=") + 9);
+    pumpDuration = durationString.toInt();
+    lastPumpStartTime = millis();
+    gpioState = true;
+    digitalWrite(controlPin, LOW);
+  }
+
+  if (millis() - lastPumpStartTime >= pumpDuration * 1000 && gpioState) {
+    totalPumpOnTime = millis() - lastPumpStartTime;
+    gpioState = false;
+    digitalWrite(controlPin, HIGH);
+}
+
+  if (request.indexOf("/download") != -1) {
+    handleDownload(client);
+    return;
+  }
+
+  int sensorValue = analogRead(sensorPin);
+  float voltage = sensorValue * (3.3 / 4095.0) * 1000;
+  voltage = max(voltage, 0.0f);
+
+  int moisturePercentage = map(voltage, 2800, 1300, 0, 100);
+  moisturePercentage = constrain(moisturePercentage, 0, 100);
+  String moistureStatus = (moisturePercentage < 50) ? "Low" : "High";
+
+  String logEntry = "Time: " + String(millis()) + ",Moisture: " + String(moisturePercentage) + ", Pump on Duration: " + String(totalPumpOnTime) + ", Status: " + moistureStatus;
+
+  moistureLogs[logIndex] = logEntry;
+  logIndex = (logIndex + 1) % MAX_LOGS;
+saveLogToFile(logEntry);
+
+  if (autoMode) {
+    gpioState = moisturePercentage < 30;
+    digitalWrite(controlPin, gpioState ? LOW : HIGH);
+  }
+
+  // Send HTML response
+  client.println("HTTP/1.1 200 OK");
+  client.println("Content-Type: text/html");
+  client.println("Connection: close");
+  client.println();
+  client.println("<html><head>");
+  client.println("<meta http-equiv='refresh' content='3'>");
+  client.println("<title>ESP32 Soil Moisture</title>");
+  client.println("<style>");
+  client.println("body { font-family: Arial, sans-serif; background-color: #121212; color: #e0e0e0; text-align: center; padding: 50px; }");
+  client.println("h1 { color: #FF0000; font-size: 56px; }");
+  client.println("p { font-size: 24px; }");
+  client.println(".button { padding: 15px 30px; margin: 10px; border: 2px solid #FF0000; background-color: transparent; color: #FF0000; font-size: 20px; cursor: pointer; }");
+  client.println(".button:hover { background-color: #FF0000; color: white; }");
+  client.println(".progress-bar { width: 100%; background-color: #333; height: 40px; border-radius: 5px; margin-top: 20px; }");
+  client.println(".progress { height: 100%; border-radius: 5px; }");
+  client.println(".log-container { background-color: #222; padding: 20px; margin-top: 20px; border-radius: 8px; }");
+  client.println(".log-container p { font-size: 16px; font-family: monospace; color: #bbb; }");
+  client.println("</style>");
+  client.println("</head><body>");
+  client.println("<h1>ESP32 Soil Moisture</h1>");
+client.println("<p>Moisture Level: " + String(moisturePercentage) + "%</p>");
+  client.println("<p>Sensor Voltage: " + String(voltage) + " mV</p>");
+  client.println("<div class='progress-bar'><div class='progress' style='width:" + String(moisturePercentage) + "%; background-color:" + (moisturePercentage < 30 ? "#f44336" : "#8bc34a") + ";'></div></div>");
+  client.println("<p>GPIO State: " + String(gpioState ? "ON" : "OFF") + "</p>");
+
+  // Buttons
+  client.println("<button class='button' onclick=\"startPump()\">Start Pump</button>");
+  client.println("<button class='button' onclick=\"stopPump()\">Stop Pump</button>");
+  client.println("<button class='button' onclick=\"toggleAuto()\">Toggle Auto Mode</button>");
+
+  // Download Button
+  client.println("<div>");
+  client.println("<a href='/download'><button class='button' style='background-color: #4CAF50; color: white;'>Download Log File</button></a>");
+  client.println("</div>");
+
+  // Log container
+  client.println("<div class='log-container'>");
+  client.println("<h3>Last 10 Logs</h3>");
+  for (int i = 0; i < MAX_LOGS; i++) {
+    int index = (logIndex + i) % MAX_LOGS;
+    client.println("<p>" + String(moistureLogs[index]) + "</p>");
+
+  }
+  client.println("</div>");
+
+  client.println("<script>");
+  client.println("function startPump() { var xhr = new XMLHttpRequest(); xhr.open('GET', '/pump?duration=10', true); xhr.send(); }");
+client.println("function stopPump() { var xhr = new XMLHttpRequest(); xhr.open('GET', '/toggle', true); xhr.send(); }");
+  client.println("function toggleAuto() { var xhr = new XMLHttpRequest(); xhr.open('GET', '/auto', true); xhr.send(); }");
+  client.println("</script>");
+  client.println("</body></html>");
+
+  client.stop();
+  Serial.println("Client Disconnected");
+}
